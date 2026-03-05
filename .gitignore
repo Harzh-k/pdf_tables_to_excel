@@ -130,6 +130,7 @@ outputs/
 *.pdf
 *.xlsx
 *.txt
+!requirements.txt
 *.log
 tmp_*.py
 debug_*.py

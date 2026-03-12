@@ -34,7 +34,7 @@ class TableReconstructor:
             if table.is_empty:
                 continue
             table = deepcopy(table)
-            table = self._fix_garbled_headers(table)
+            table = self._fix_garbled_text(table)
             table = self._fix_corrupted_numbers(table)
             table = self._split_merged_columns(table)
             table = self._realign_displaced_columns(table)
@@ -73,9 +73,13 @@ class TableReconstructor:
         # Infer schedule column from headers and ref-code distribution.
         schedule_col = -1
         for hrow in table.headers[:8]:
+            # Skip title/spanning rows (<=2 non-empty cells)
+            non_empty_count = sum(1 for c in hrow if str(c).strip())
+            if non_empty_count < 3:
+                continue
             for ci, c in enumerate(hrow):
                 up = str(c).upper().strip()
-                if "SCHEDULE" in up or "REF" in up:
+                if ("SCHEDULE" in up or "REF" in up) and len(up) < 40:
                     schedule_col = ci
                     break
             if schedule_col >= 0:
@@ -94,8 +98,6 @@ class TableReconstructor:
             if ref_hits_by_col[best_col] >= 2:
                 schedule_col = best_col
 
-        if schedule_col < 0 and max_cols > 1:
-            schedule_col = 1
         if schedule_col == 0 and max_cols > 1:
             schedule_col = 1
         if schedule_col < 0:
@@ -323,24 +325,15 @@ class TableReconstructor:
     # ══════════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def _fix_garbled_headers(table: TableData) -> TableData:
+    def _fix_garbled_text(table: TableData) -> TableData:
         """
-        Fix headers where pdfplumber extracts vertical/rotated text as
-        single characters separated by spaces, e.g.:
-          'I n V s a u r r i a a n b c le e' → 'Variable Insurance'
-          'ssets H a e b l o d ...' → garbled NAV header
-        
-        Strategy: detect cells where most tokens are 1-2 chars and collapse them,
-        then try to match against known IRDAI column names.
+        Fix garbled text in all cells:
+        1. Spaced-out text: 'P a rt ic i pating' → 'Participating'
+        2. Interleaved vertical headers: 'I n V s a u r r ...' → 'Variable Insurance'
+        3. Overlay garble: detect and clear hopelessly garbled cells from
+           overlapping PDF text layers.
         """
-        # Known IRDAI sub-column names that appear in garbled form
-        _KNOWN_NAMES = {
-            'VARIABLE INSURANCE': 'Variable Insurance',
-            'VAR INS': 'Var. Ins',
-            'VARINS': 'Var. Ins',
-        }
-        
-        all_rows = table.headers + table.rows[:5]  # Check headers + first few rows
+        all_rows = table.headers + table.rows
         if not all_rows:
             return table
         
@@ -348,6 +341,11 @@ class TableReconstructor:
             for ci in range(len(row)):
                 cell = str(row[ci]).strip()
                 if not cell or len(cell) < 5:
+                    continue
+                
+                # Detect severely garbled overlay text (interleaved text layers)
+                if _is_garbled_overlay(cell):
+                    row[ci] = ""
                     continue
                 
                 row[ci] = _degarble_cell(cell)
@@ -491,9 +489,15 @@ class TableReconstructor:
         # Only run this repair on schedule-like tables.
         schedule_col = -1
         for hrow in table.headers[:8]:
+            # Skip title/spanning rows (<=2 non-empty cells) — the word
+            # 'SCHEDULE' in a title like 'FORM L-6-OPERATING EXPENSES SCHEDULE'
+            # does NOT indicate a schedule reference column.
+            non_empty_count = sum(1 for c in hrow if str(c).strip())
+            if non_empty_count < 3:
+                continue
             for ci, c in enumerate(hrow):
                 up = str(c).upper().strip()
-                if "SCHEDULE" in up or "REF" in up:
+                if ("SCHEDULE" in up or "REF" in up) and len(up) < 40:
                     schedule_col = ci
                     break
             if schedule_col >= 0:
@@ -516,15 +520,12 @@ class TableReconstructor:
                 if ref_hits_by_col[best_col] >= 2:
                     schedule_col = best_col
 
-        # Last fallback for IRDAI layouts.
-        if schedule_col < 0 and any(len(r) > 1 for r in table.rows):
-            schedule_col = 1
-
         # Col0 is almost always label/particulars. If detection picked 0 and
         # table has at least 2 cols, prefer col1.
         if schedule_col == 0 and any(len(r) > 1 for r in table.rows):
             schedule_col = 1
 
+        # If no schedule column detected by header or ref-code evidence, skip.
         if schedule_col < 0:
             return table
         token_pattern = re.compile(
@@ -663,10 +664,10 @@ class TableReconstructor:
                             tokens_count[len(tokens)] = tokens_count.get(len(tokens), 0) + 1
                         data_cells_count += 1
             
-            if data_cells_count >= 3 and tokens_count:
+            if data_cells_count >= 5 and tokens_count:
                 best_k = max(tokens_count.keys(), key=lambda k: tokens_count[k])
-                # Only split if at least 30% of numeric cells have exactly best_k tokens
-                if best_k > 1 and tokens_count[best_k] >= data_cells_count * 0.3:
+                # Only split if at least 40% of numeric cells have exactly best_k tokens
+                if best_k > 1 and tokens_count[best_k] >= data_cells_count * 0.4:
                     col_splits[ci] = best_k
         
         if not col_splits:
@@ -1105,6 +1106,7 @@ class TableReconstructor:
         header_rows: list[list[str]] = []
         data_rows: list[list[str]] = []
         found_data = False
+        seen_column_band = False  # True once we see a row with 3+ non-empty cells
 
         for ri, row in enumerate(all_rows):
             # Strong data boundary: once a row clearly looks like data
@@ -1113,6 +1115,23 @@ class TableReconstructor:
                 found_data = True
                 data_rows.append(row)
             elif not found_data and self._is_header_row(row, ri, all_rows):
+                non_empty_count = sum(1 for c in row if str(c).strip())
+                if non_empty_count >= 3:
+                    seen_column_band = True
+
+                # After column headers, a sparse row with content only in the
+                # first 1-2 columns is a section label (e.g. "Breakdown by
+                # credit rating"), not a column header.
+                if seen_column_band and non_empty_count <= 2:
+                    has_inner_content = any(
+                        str(row[ci]).strip()
+                        for ci in range(2, len(row))
+                    )
+                    if not has_inner_content:
+                        found_data = True
+                        data_rows.append(row)
+                        continue
+
                 header_rows.append(row)
             else:
                 found_data = True
@@ -1120,6 +1139,20 @@ class TableReconstructor:
 
         if not header_rows and data_rows:
             header_rows = [data_rows.pop(0)]
+
+        # Remove near-duplicate header rows (e.g. "DETAIL REGARDING..."
+        # vs "DETAILS REGARDING..." differing by 1-2 characters).
+        if len(header_rows) > 1:
+            from difflib import SequenceMatcher
+            filtered = [header_rows[0]]
+            for i in range(1, len(header_rows)):
+                prev_text = ' '.join(str(c).strip() for c in filtered[-1] if str(c).strip()).upper()
+                curr_text = ' '.join(str(c).strip() for c in header_rows[i] if str(c).strip()).upper()
+                if prev_text and curr_text and len(prev_text) > 10 and len(curr_text) > 10:
+                    if SequenceMatcher(None, prev_text, curr_text).ratio() > 0.85:
+                        continue  # skip near-duplicate
+                filtered.append(header_rows[i])
+            header_rows = filtered
 
         # If everything is classified as header, preserve only a shallow header band
         # and move the rest to data to avoid overlapping-header artifacts.
@@ -1164,6 +1197,13 @@ class TableReconstructor:
         if first and not self._is_numeric(first) and numeric_count >= 2:
             return True
 
+        # Numbered data rows: first cell is a serial/item number (e.g. "1", "12")
+        # with at least one other non-empty cell → data, not header.
+        if first and re.match(r'^\d{1,3}$', first):
+            other_non_empty = sum(1 for c in row[1:] if str(c).strip())
+            if other_non_empty >= 1:
+                return True
+
         return False
 
     def _is_header_row(self, row: list[str], row_idx: int, all_rows: list[list[str]] = None) -> bool:
@@ -1187,15 +1227,28 @@ class TableReconstructor:
             "PARTICULARS",
             "SCHEDULE",
             "REF. FORM",
+            "REF FORM",
             "REGISTRATION NUMBER",
+            "REGISTRATION NO",
+            "REGISTRATION",
+            "FORM L-",
         )
         if row_idx <= 15 and any(k in first_cell for k in meta_keywords) and text >= 1:
             return True
 
+        # Rows with mostly text in early positions are likely metadata headers
+        # even if they contain a year number (e.g. "REGISTRATION ... 2005").
+        if row_idx <= 10 and text >= 1 and text >= numeric:
+            # Check if the only numeric cells are year-like (4-digit numbers)
+            nums = [c.strip() for c in non_empty if self._is_numeric(c)]
+            if all(re.match(r'^\d{4}$', n) for n in nums):
+                return True
+
         # Multi-column header band rows (Individual/Group/Pension/etc.)
         # can appear with empty first cell and should remain in headers.
         row_upper = ' '.join(c.strip().upper() for c in row if c.strip())
-        band_keywords = ("INDIVIDUAL", "GROUP", "PENSION", "ANNUITY", "VARIABLE", "HEALTH")
+        band_keywords = ("INDIVIDUAL", "GROUP", "PENSION", "ANNUITY", "VARIABLE",
+                         "HEALTH", "LINKED", "PARTICIPATING", "NON-PARTICIPATING")
         if row_idx <= 20 and numeric == 0 and any(k in row_upper for k in band_keywords):
             return True
 
@@ -1240,6 +1293,10 @@ class TableReconstructor:
                             return False
                 
                 return text == 1
+        # For early rows, be more lenient — equal text/numeric counts still
+        # suggest a header (e.g. company name + year number).
+        if row_idx <= 10:
+            return text >= numeric
         return text > numeric
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1468,17 +1525,34 @@ class TableReconstructor:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def _is_garbled_overlay(text: str) -> bool:
+    """Detect text garbled by overlapping PDF text layers.
+    
+    When a PDF renders two text streams on top of each other, pdfplumber
+    interleaves their characters, producing long strings with a very high
+    ratio of single alphabetic characters. Example:
+      'To ratify t o h f e t h re e m C u o n m e p ra a t n i y o n ...'
+    """
+    if not text or len(text) < 60:
+        return False
+    tokens = text.split()
+    if len(tokens) < 15:
+        return False
+    single_alpha = sum(1 for t in tokens if len(t) == 1 and t.isalpha())
+    return single_alpha / len(tokens) > 0.35
+
+
 def _degarble_cell(text: str) -> str:
     """
     Fix garbled text where pdfplumber extracts vertical/rotated text as
-    single characters separated by spaces (from vertical/rotated columns).
+    single characters separated by spaces (from vertical/rotated columns),
+    or where normal text has extra spaces inserted between character groups.
     
-    The characters from multiple vertical words are interleaved, so we use
-    character-frequency (anagram) matching against known IRDAI terms.
-    
-    Example:
+    Examples:
       'Life Pension Health I n V s a u r r i a a n b c le e'
       → 'Life Pension Health Variable Insurance'
+      
+      'P a rt ic i pating' → 'Participating'
     """
     if not text or len(text) < 5:
         return text
@@ -1488,24 +1562,33 @@ def _degarble_cell(text: str) -> str:
         return '\n'.join(_degarble_cell(line) for line in lines)
     
     tokens = text.split()
-    if len(tokens) < 4:
+    if len(tokens) < 3:
         return text
     
-    # Find runs of short tokens (1-2 chars) — these are garbled segments
-    # Rebuild text by replacing garbled runs with matched known words
+    # Find runs of short alphabetic tokens (1-2 chars) — these are garbled segments.
+    # After collecting a run, also grab the next token if it looks like a
+    # word-tail continuation (starts with lowercase).
     result_parts = []
     i = 0
     while i < len(tokens):
         t = tokens[i]
-        if len(t) <= 2 and not t.isdigit():
-            # Collect consecutive short tokens
+        if len(t) <= 2 and any(c.isalpha() for c in t):
+            # Collect consecutive short alphabetic tokens
             chars = [t]
             j = i + 1
-            while j < len(tokens) and len(tokens[j]) <= 2 and not tokens[j].isdigit():
+            while j < len(tokens) and len(tokens[j]) <= 2 and any(c.isalpha() for c in tokens[j]):
                 chars.append(tokens[j])
                 j += 1
             
-            if len(chars) >= 4:
+            # Include trailing longer token if it looks like a word continuation
+            # (starts with lowercase letter — tail fragment of a spaced-out word)
+            if j < len(tokens) and len(chars) >= 3:
+                next_tok = tokens[j]
+                if next_tok and next_tok[0].islower():
+                    chars.append(next_tok)
+                    j += 1
+            
+            if len(chars) >= 3:
                 collapsed = ''.join(chars)
                 matched = _match_known_words(collapsed)
                 result_parts.append(matched)

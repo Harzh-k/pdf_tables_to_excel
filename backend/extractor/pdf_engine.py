@@ -239,6 +239,17 @@ class PDFExtractor:
                     if avg_len < 3 and ncols > 10:
                         return False
                     break
+            # Check for garbled overlay text (interleaved text layers)
+            for row in all_rows[:10]:
+                for cell in row:
+                    if not cell or len(cell) < 60:
+                        continue
+                    tokens = cell.split()
+                    if len(tokens) < 15:
+                        continue
+                    single_alpha = sum(1 for t in tokens if len(t) == 1 and t.isalpha())
+                    if single_alpha / len(tokens) > 0.35:
+                        return False
         return True
 
     def _try_extract(
